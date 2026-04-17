@@ -1,0 +1,130 @@
+# =============================================================================
+#  IronSentinel-FIM  –  Configuration File  (config.yaml)
+#  By DexAShield Technologies
+#
+#  All paths support %ENVIRONMENT_VARIABLE% expansion.
+#  Edit this file and restart the agent or service for changes to take effect.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Monitoring targets
+# ---------------------------------------------------------------------------
+monitor:
+
+  # Filesystem paths to watch (absolute Windows paths).
+  # Use forward OR back slashes; YAML requires backslashes escaped or quoted.
+  paths:
+    - 'C:\Windows\System32\config'           # SAM, SYSTEM, SECURITY hives
+    - 'C:\Windows\System32\drivers\etc'      # hosts, lmhosts, services
+    - 'C:\Windows\System32\GroupPolicy'      # GPO scripts
+    - 'C:\Windows\System32\Tasks'            # Scheduled tasks
+    - 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup'
+    - 'C:\Users\Public'
+    # Uncomment to monitor individual user profiles (high volume):
+    # - '%USERPROFILE%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
+
+  # Windows Registry keys to poll for value changes.
+  # Format: HIVE\subkey  (HKLM, HKCU, HKCR, HKU, HKCC)
+  registry_keys:
+    - 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+    - 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+    - 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunServices'
+    - 'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+    - 'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+    - 'HKLM\SYSTEM\CurrentControlSet\Services'
+    - 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    - 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+    - 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa'
+
+  # Only alert on files with these extensions.
+  # Leave empty ([]) to monitor ALL file types (high volume on busy systems).
+  extensions:
+    - .exe
+    - .dll
+    - .sys
+    - .bat
+    - .cmd
+    - .ps1
+    - .vbs
+    - .js
+    - .reg
+    - .ini
+    - .cfg
+    - .conf
+    - .xml
+    - .json
+
+  # Recurse into subdirectories of each monitored path?
+  recursive: true
+
+  # How often (seconds) to poll registry keys for changes.
+  registry_poll_interval: 10
+
+# ---------------------------------------------------------------------------
+# Baseline snapshot settings
+# ---------------------------------------------------------------------------
+baseline:
+  # Path to the baseline JSON file (relative or absolute).
+  file: ironsentinel_baseline.json
+
+  # Automatically update the baseline after an alert fires?
+  # Set to false to keep a "frozen" reference snapshot.
+  auto_save: true
+
+  # Hash algorithm for file integrity checks.
+  # Options: sha256 (recommended), sha512, md5 (legacy only)
+  hash_algorithm: sha256
+
+# ---------------------------------------------------------------------------
+# Alert output settings
+# ---------------------------------------------------------------------------
+alerts:
+  # Minimum severity to display/log: INFO | LOW | MEDIUM | HIGH | CRITICAL
+  min_severity: INFO
+
+  # Write alerts to a JSON-lines file?
+  log_to_file: true
+
+  # Path of the JSON-lines alert log.
+  log_file: ironsentinel_alerts.jsonl
+
+  # Print rich coloured alerts to the console?
+  # Automatically disabled when running as a Windows Service.
+  console_output: true
+
+# ---------------------------------------------------------------------------
+# Ignore / suppress rules
+# ---------------------------------------------------------------------------
+ignore:
+  # Suppress alerts for events under these paths (substring match).
+  paths:
+    - 'C:\Windows\System32\config\TxR'
+    - 'C:\Windows\Temp'
+    - 'C:\Windows\SoftwareDistribution\Download'
+    - 'C:\Windows\WinSxS'
+    - 'C:\Windows\assembly'
+
+  # Suppress alerts attributed to these process names (case-insensitive).
+  processes:
+    - MsMpEng.exe         # Windows Defender
+    - SgrmBroker.exe      # System Guard Runtime Monitor
+    - WinDefend           # Windows Defender service
+    - TiWorker.exe        # Windows Update
+    - TrustedInstaller.exe
+
+  # Suppress alerts for files with these extensions.
+  extensions:
+    - .log
+    - .tmp
+    - .temp
+    - .etl
+    - .evtx
+    - .pf                 # Prefetch
+
+# ---------------------------------------------------------------------------
+# Internal logging (Python logging module, not the alert log)
+# ---------------------------------------------------------------------------
+logging:
+  # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  level: INFO
+  file: ironsentinel.log
