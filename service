@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  IronSentinel-FIM  –  Windows Service Wrapper
+#  By DexAShield Technologies
+#
+#  Usage (run as Administrator):
+#    python service.py install      – Install as auto-start Windows Service
+#    python service.py uninstall    – Remove the service
+#    python service.py start        – Start the installed service
+#    python service.py stop         – Stop the running service
+#    python service.py status       – Print current service state
+#    python service.py debug        – Run in foreground (console) for testing
+#
+#  The service runs silently in the background.  All output goes to:
+#    ironsentinel_service.log  (in the same directory as this file)
+#    ironsentinel_alerts.jsonl (alert log)
+#    ironsentinel.log          (agent log)
+# =============================================================================
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+import socket
+import logging
+import threading
+import argparse
+from pathlib import Path
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Ensure the project directory is on sys.path so ironsentinel_agent imports
+# ---------------------------------------------------------------------------
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+# ---------------------------------------------------------------------------
+# pywin32 service imports – required for service mode only
+# ---------------------------------------------------------------------------
+try:
+    import servicemanager
+    import win32event
+    import win32service
+    import win32serviceutil
+    _PYWIN32_OK = True
+except ImportError:
+    _PYWIN32_OK = False
+
+from ironsentinel_agent import (
+    IronSentinelAgent,
+    TOOL_NAME,
+    VERSION,
+    AUTHOR,
+)
+
+# =============================================================================
+# SERVICE METADATA
+# =============================================================================
+
+SERVICE_NAME         = "IronSentinelFIM"
+SERVICE_DISPLAY_NAME = "IronSentinel File Integrity Monitor"
+SERVICE_DESCRIPTION  = (
+    "Windows-native File Integrity Monitoring and Privilege Abuse Detection agent. "
+    "Monitors critical system files, registry keys, and ACL changes in real-time. "
+    f"Built by {AUTHOR}. "
+    "MITRE ATT&CK: T1003, T1222, T1485, T1565, T1112, T1547."
+)
+
+
+# =============================================================================
+# SERVICE CLASS
+# =============================================================================
+
+class IronSentinelService(win32serviceutil.ServiceFramework if _PYWIN32_OK else object):
+    """
+    Windows Service wrapper that hosts IronSentinelAgent.
+
+    Lifecycle:
+      SvcDoRun   → called by the SCM when the service starts
+      SvcStop    → called by the SCM when stop is requested
+    """
+
+    _svc_name_         = SERVICE_NAME
+    _svc_display_name_ = SERVICE_DISPLAY_NAME
+    _svc_description_  = SERVICE_DESCRIPTION
+
+    # Set a default timeout so socket ops don't block the stop signal
+    socket.setdefaulttimeout(120)
+
+    # ------------------------------------------------------------------
+
+    def __init__(self, args) -> None:
+        if _PYWIN32_OK:
+            win32serviceutil.ServiceFramework.__init__(self, args)
+        self._wait_stop   = win32event.CreateEvent(None, 0, 0, None) if _PYWIN32_OK else None
+        self._agent:       Optional[IronSentinelAgent] = None
+        self._agent_thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    # SCM callbacks
+    # ------------------------------------------------------------------
+
+    def SvcStop(self) -> None:
+        """Called by the Service Control Manager to stop the service."""
+        if _PYWIN32_OK:
+            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+
+        _svc_log(f"{SERVICE_NAME} stop requested.")
+
+        if self._agent:
+            self._agent.stop()
+
+        if _PYWIN32_OK:
+            win32event.SetEvent(self._wait_stop)
+            self.ReportServiceStatus(win32service.SERVICE_STOPPED)
+
+        _svc_log(f"{SERVICE_NAME} stopped.")
+
+    def SvcDoRun(self) -> None:
+        """Main service entry point."""
+        _setup_service_logging(_HERE)
+
+        if _PYWIN32_OK:
+            servicemanager.LogMsg(
+                servicemanager.EVENTLOG_INFORMATION_TYPE,
+                servicemanager.PYS_SERVICE_STARTED,
+                (self._svc_name_, ""),
+            )
+
+        _svc_log(f"Starting {TOOL_NAME} v{VERSION}…")
+
+        config_path = str(_HERE / "config.yaml")
+
+        try:
+            self._agent = IronSentinelAgent(
+                config_path=config_path,
+                debug=False,
+                service_mode=True,   # suppresses Rich console output
+            )
+
+            # Run the agent in its own thread so this thread can block on
+            # the Windows stop event.
+            self._agent_thread = threading.Thread(
+                target=self._run_agent,
+                name="IronSentinelAgentThread",
+                daemon=True,
+            )
+            self._agent_thread.start()
+            _svc_log(f"{SERVICE_NAME}: agent thread started.")
+
+            # Block here until SCM sends stop signal
+            if _PYWIN32_OK:
+                win32event.WaitForSingleObject(self._wait_stop, win32event.INFINITE)
+            else:
+                # Fallback: sleep loop (console debug mode)
+                while self._agent._running:
+                    time.sleep(2)
+
+        except Exception as exc:
+            _svc_log(f"FATAL: {exc}", level=logging.CRITICAL)
+            if _PYWIN32_OK:
+                servicemanager.LogErrorMsg(f"{SERVICE_NAME} fatal: {exc}")
+            raise
+
+    # ------------------------------------------------------------------
+
+    def _run_agent(self) -> None:
+        """
+        Runs inside the agent thread.
+        Calls agent.start() which blocks internally until _stop_event is set.
+        """
+        try:
+            if self._agent:
+                self._agent.start()
+        except Exception as exc:
+            _svc_log(f"Agent thread error: {exc}", level=logging.ERROR)
+
+
+# =============================================================================
+# LOGGING HELPERS
+# =============================================================================
+
+def _setup_service_logging(base_dir: Path) -> None:
+    log_path = base_dir / "ironsentinel_service.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  [%(levelname)-8s]  %(message)s",
+        handlers=[logging.FileHandler(str(log_path), encoding="utf-8")],
+        force=True,
+    )
+
+
+def _svc_log(msg: str, level: int = logging.INFO) -> None:
+    logging.log(level, f"[{SERVICE_NAME}] {msg}")
+
+
+# =============================================================================
+# SERVICE MANAGEMENT HELPERS
+# =============================================================================
+
+def _require_pywin32() -> None:
+    if not _PYWIN32_OK:
+        print("✘  pywin32 is required for service management:")
+        print("   pip install pywin32")
+        sys.exit(1)
+
+
+def _require_admin() -> None:
+    import ctypes
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        print("✘  Administrator privileges are required.")
+        print("   Right-click the terminal → Run as Administrator")
+        sys.exit(1)
+
+
+def cmd_install() -> None:
+    _require_pywin32()
+    _require_admin()
+    print(f"Installing  »  {SERVICE_DISPLAY_NAME}…")
+    try:
+        win32serviceutil.InstallService(
+            IronSentinelService._svc_reg_class_,
+            SERVICE_NAME,
+            SERVICE_DISPLAY_NAME,
+            description=SERVICE_DESCRIPTION,
+            startType=win32service.SERVICE_AUTO_START,
+            exeName=sys.executable,
+            exeArgs=f'"{Path(__file__).resolve()}"',
+        )
+        print(f"✔  Service installed as '{SERVICE_NAME}' (auto-start).")
+        print(f"   Start now with:  python service.py start")
+    except Exception as exc:
+        print(f"✘  Install failed: {exc}")
+        sys.exit(1)
+
+
+def cmd_uninstall() -> None:
+    _require_pywin32()
+    _require_admin()
+    # Try to stop first
+    try:
+        win32serviceutil.StopService(SERVICE_NAME)
+        time.sleep(2)
+    except Exception:
+        pass
+    print(f"Uninstalling  »  {SERVICE_DISPLAY_NAME}…")
+    try:
+        win32serviceutil.RemoveService(SERVICE_NAME)
+        print(f"✔  Service '{SERVICE_NAME}' removed.")
+    except Exception as exc:
+        print(f"✘  Uninstall failed: {exc}")
+        sys.exit(1)
+
+
+def cmd_start() -> None:
+    _require_pywin32()
+    _require_admin()
+    print(f"Starting  »  {SERVICE_DISPLAY_NAME}…")
+    try:
+        win32serviceutil.StartService(SERVICE_NAME)
+        # Poll until running (max 15 s)
+        for _ in range(15):
+            status = win32serviceutil.QueryServiceStatus(SERVICE_NAME)
+            if status[1] == win32service.SERVICE_RUNNING:
+                print(f"✔  Service is running.")
+                return
+            time.sleep(1)
+        print("⚠  Timeout — check ironsentinel_service.log for errors.")
+    except Exception as exc:
+        print(f"✘  Start failed: {exc}")
+        sys.exit(1)
+
+
+def cmd_stop() -> None:
+    _require_pywin32()
+    _require_admin()
+    print(f"Stopping  »  {SERVICE_DISPLAY_NAME}…")
+    try:
+        win32serviceutil.StopService(SERVICE_NAME)
+        for _ in range(15):
+            status = win32serviceutil.QueryServiceStatus(SERVICE_NAME)
+            if status[1] == win32service.SERVICE_STOPPED:
+                print(f"✔  Service stopped.")
+                return
+            time.sleep(1)
+        print("⚠  Timeout waiting for stop.")
+    except Exception as exc:
+        print(f"✘  Stop failed: {exc}")
+        sys.exit(1)
+
+
+def cmd_status() -> None:
+    _require_pywin32()
+    _state_map = {
+        win32service.SERVICE_STOPPED:       "STOPPED",
+        win32service.SERVICE_START_PENDING: "START_PENDING",
+        win32service.SERVICE_STOP_PENDING:  "STOP_PENDING",
+        win32service.SERVICE_RUNNING:       "RUNNING",
+        win32service.SERVICE_CONTINUE_PENDING: "CONTINUE_PENDING",
+        win32service.SERVICE_PAUSE_PENDING: "PAUSE_PENDING",
+        win32service.SERVICE_PAUSED:        "PAUSED",
+    }
+    try:
+        status = win32serviceutil.QueryServiceStatus(SERVICE_NAME)
+        state  = _state_map.get(status[1], f"UNKNOWN ({status[1]})")
+        print(f"Service '{SERVICE_NAME}': {state}")
+    except Exception as exc:
+        print(f"✘  Status check failed: {exc} (is the service installed?)")
+
+
+def cmd_debug() -> None:
+    """Run the agent in foreground mode — useful for development."""
+    print(f"Running {TOOL_NAME} in console/debug mode  (Ctrl+C to stop)\n")
+    agent = IronSentinelAgent(
+        config_path=str(_HERE / "config.yaml"),
+        debug=True,
+        service_mode=False,
+    )
+    agent.start()
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="service.py",
+        description=f"{SERVICE_DISPLAY_NAME} — Service Manager",
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["install", "uninstall", "start", "stop", "status", "debug"],
+        help="Management action",
+    )
+    args, remaining = parser.parse_known_args()
+
+    # Map CLI commands to handler functions
+    dispatch = {
+        "install":   cmd_install,
+        "uninstall": cmd_uninstall,
+        "start":     cmd_start,
+        "stop":      cmd_stop,
+        "status":    cmd_status,
+        "debug":     cmd_debug,
+    }
+
+    if args.action in dispatch:
+        dispatch[args.action]()
+        return
+
+    if not _PYWIN32_OK:
+        print("pywin32 not found — service mode unavailable.")
+        print("Run in console mode with:  python ironsentinel_agent.py --run")
+        sys.exit(1)
+
+    # No explicit action: let pywin32 handle argv (e.g. when SCM calls us)
+    if len(sys.argv) == 1:
+        # Started by SCM without arguments → launch as service
+        servicemanager.Initialize()
+        servicemanager.PrepareToHostSingle(IronSentinelService)
+        servicemanager.StartServiceCtrlDispatcher()
+    else:
+        win32serviceutil.HandleCommandLine(IronSentinelService)
+
+
+if __name__ == "__main__":
+    main()
