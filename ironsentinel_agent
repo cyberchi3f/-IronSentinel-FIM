@@ -1,0 +1,1427 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  IronSentinel-FIM  v1.0.0
+#  Windows-Native File Integrity Monitoring & Privilege Abuse Detection Agent
+#  By DexAShield Technologies
+#
+#  MITRE ATT&CK Coverage:
+#    T1003  – OS Credential Dumping
+#    T1222  – File & Directory Permissions Modification
+#    T1485  – Data Destruction
+#    T1565  – Data Manipulation
+#    T1112  – Modify Registry
+#    T1547  – Boot/Logon Autostart (Registry Run Keys)
+# =============================================================================
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+import json
+import hashlib
+import logging
+import threading
+import argparse
+import ctypes
+import winreg
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Tuple
+
+# ---------------------------------------------------------------------------
+# Third-party imports – all guarded with informative ImportErrors
+# ---------------------------------------------------------------------------
+try:
+    import psutil
+except ImportError:
+    raise ImportError("psutil is required: pip install psutil")
+
+try:
+    import yaml
+except ImportError:
+    raise ImportError("PyYAML is required: pip install pyyaml")
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import (
+        FileSystemEventHandler,
+        FileModifiedEvent,
+        FileCreatedEvent,
+        FileDeletedEvent,
+        FileMovedEvent,
+    )
+except ImportError:
+    raise ImportError("watchdog is required: pip install watchdog")
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.rule import Rule
+    from rich.columns import Columns
+    from rich import box
+except ImportError:
+    raise ImportError("rich is required: pip install rich")
+
+try:
+    import colorama
+    colorama.init(autoreset=True)
+except ImportError:
+    pass  # colorama is optional; rich handles colour on modern terminals
+
+# pywin32 is optional – ACL features degrade gracefully without it
+_WIN32_AVAILABLE = False
+try:
+    import win32security
+    import win32api
+    import win32con
+    import pywintypes
+    _WIN32_AVAILABLE = True
+except ImportError:
+    pass  # ACL monitoring will be disabled; all other features remain active
+
+# =============================================================================
+# GLOBAL CONSTANTS
+# =============================================================================
+
+VERSION         = "1.0.0"
+TOOL_NAME       = "IronSentinel-FIM"
+AUTHOR          = "DexAShield Technologies"
+TOOL_TAGLINE    = "Windows-Native FIM & Privilege Abuse Detection"
+
+# ---------------------------------------------------------------------------
+# MITRE ATT&CK technique metadata
+# ---------------------------------------------------------------------------
+MITRE_TECHNIQUES: Dict[str, Dict[str, Any]] = {
+    "T1003": {
+        "name":           "OS Credential Dumping",
+        "tactic":         "Credential Access",
+        "url":            "https://attack.mitre.org/techniques/T1003/",
+        "severity_bonus": 35,
+    },
+    "T1222": {
+        "name":           "File & Directory Permissions Modification",
+        "tactic":         "Defense Evasion",
+        "url":            "https://attack.mitre.org/techniques/T1222/",
+        "severity_bonus": 25,
+    },
+    "T1485": {
+        "name":           "Data Destruction",
+        "tactic":         "Impact",
+        "url":            "https://attack.mitre.org/techniques/T1485/",
+        "severity_bonus": 30,
+    },
+    "T1565": {
+        "name":           "Data Manipulation",
+        "tactic":         "Impact",
+        "url":            "https://attack.mitre.org/techniques/T1565/",
+        "severity_bonus": 20,
+    },
+    "T1112": {
+        "name":           "Modify Registry",
+        "tactic":         "Defense Evasion",
+        "url":            "https://attack.mitre.org/techniques/T1112/",
+        "severity_bonus": 25,
+    },
+    "T1547": {
+        "name":           "Boot/Logon Autostart Execution",
+        "tactic":         "Persistence",
+        "url":            "https://attack.mitre.org/techniques/T1547/",
+        "severity_bonus": 30,
+    },
+}
+
+# ---------------------------------------------------------------------------
+# High-sensitivity credential paths (T1003)
+# ---------------------------------------------------------------------------
+CREDENTIAL_PATHS: List[str] = [
+    r"C:\Windows\System32\config\SAM",
+    r"C:\Windows\System32\config\SYSTEM",
+    r"C:\Windows\System32\config\SECURITY",
+    r"C:\Windows\System32\config\SOFTWARE",
+    r"C:\Windows\System32\config\DEFAULT",
+    r"C:\Windows\System32\config\RegBack\SAM",
+    r"C:\Windows\System32\config\RegBack\SYSTEM",
+    r"C:\Windows\NTDS\ntds.dit",
+    r"C:\Windows\System32\lsass.exe",
+    r"C:\Windows\System32\lsaiso.exe",
+    r"C:\Windows\System32\wdigest.dll",
+    r"C:\Windows\System32\kerberos.dll",
+    r"C:\Windows\System32\msv1_0.dll",
+]
+
+CREDENTIAL_KEYWORDS: List[str] = [
+    "sam", "ntds.dit", "lsass", "lsaiso", "kerberos",
+    "credential", "vault", "dpapi", "security\\config",
+    "password", "ntlm", "mimikatz",
+]
+
+# ---------------------------------------------------------------------------
+# Processes allowed to touch sensitive files without raising the score
+# ---------------------------------------------------------------------------
+SYSTEM_PROCESS_WHITELIST: set = {
+    "system", "smss.exe", "csrss.exe", "wininit.exe",
+    "winlogon.exe", "services.exe", "lsass.exe", "svchost.exe",
+    "dwm.exe", "explorer.exe", "taskhostw.exe", "wuauclt.exe",
+    "trustedinstaller.exe", "tiworker.exe", "msiexec.exe",
+}
+
+# ---------------------------------------------------------------------------
+# Severity bands: (min_score, max_score) -> (label, rich_colour, emoji)
+# ---------------------------------------------------------------------------
+_SEVERITY_MAP: List[Tuple[Tuple[int, int], Tuple[str, str, str]]] = [
+    ((0,  25),  ("INFO",     "bright_blue",  "ℹ️ ")),
+    ((26, 50),  ("LOW",      "green",        "🟢")),
+    ((51, 75),  ("MEDIUM",   "yellow",       "🟡")),
+    ((76, 90),  ("HIGH",     "dark_orange",  "🟠")),
+    ((91, 100), ("CRITICAL", "bright_red",   "🔴")),
+]
+
+def get_severity(score: int) -> Tuple[str, str, str]:
+    """Return (label, rich_colour, emoji) for a given 0-100 score."""
+    for (lo, hi), result in _SEVERITY_MAP:
+        if lo <= score <= hi:
+            return result
+    return "CRITICAL", "bright_red", "🔴"
+
+
+# =============================================================================
+# DEFAULT CONFIGURATION
+# =============================================================================
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "monitor": {
+        "paths": [
+            r"C:\Windows\System32\config",
+            r"C:\Windows\System32\drivers\etc",
+            r"C:\Windows\System32\GroupPolicy",
+            r"C:\Windows\System32\Tasks",
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup",
+            r"C:\Users\Public",
+        ],
+        "registry_keys": [
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+            r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+            r"HKLM\SYSTEM\CurrentControlSet\Services",
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
+        ],
+        # Only alert on files with these extensions (empty = all files)
+        "extensions": [
+            ".exe", ".dll", ".sys", ".bat", ".cmd",
+            ".ps1", ".vbs", ".js", ".reg", ".ini",
+            ".cfg", ".conf", ".xml", ".json",
+        ],
+        "recursive":               True,
+        "registry_poll_interval":  10,   # seconds between registry polls
+    },
+    "baseline": {
+        "file":           "ironsentinel_baseline.json",
+        "auto_save":      True,
+        "hash_algorithm": "sha256",
+    },
+    "alerts": {
+        "min_severity":   "INFO",
+        "log_to_file":    True,
+        "log_file":       "ironsentinel_alerts.jsonl",
+        "console_output": True,
+    },
+    "ignore": {
+        "paths": [
+            r"C:\Windows\System32\config\TxR",
+            r"C:\Windows\Temp",
+            r"C:\Windows\SoftwareDistribution\Download",
+        ],
+        "processes":   ["MsMpEng.exe", "SgrmBroker.exe", "WinDefend"],
+        "extensions":  [".log", ".tmp", ".temp", ".etl", ".evtx"],
+    },
+    "logging": {
+        "level": "INFO",
+        "file":  "ironsentinel.log",
+    },
+}
+
+
+# =============================================================================
+# CONFIG LOADER
+# =============================================================================
+
+class Config:
+    """
+    Loads configuration from a YAML file and merges it over the built-in
+    defaults.  Falls back to defaults gracefully on any error.
+    """
+
+    def __init__(self, config_path: str = "config.yaml") -> None:
+        self.config_path = config_path
+        self.data = self._load()
+
+    # ------------------------------------------------------------------
+    def _load(self) -> Dict:
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as fh:
+                    loaded = yaml.safe_load(fh)
+                    if isinstance(loaded, dict):
+                        return self._deep_merge(DEFAULT_CONFIG, loaded)
+            except Exception as exc:
+                logging.warning(f"Config load failed ({exc}). Using built-in defaults.")
+        return dict(DEFAULT_CONFIG)
+
+    def _deep_merge(self, base: Dict, override: Dict) -> Dict:
+        result = dict(base)
+        for key, val in override.items():
+            if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+                result[key] = self._deep_merge(result[key], val)
+            else:
+                result[key] = val
+        return result
+
+    def get(self, *keys: str, default: Any = None) -> Any:
+        node = self.data
+        for k in keys:
+            if isinstance(node, dict) and k in node:
+                node = node[k]
+            else:
+                return default
+        return node
+
+
+# =============================================================================
+# PROCESS CONTEXT COLLECTOR
+# =============================================================================
+
+class ProcessContextCollector:
+    """
+    Uses psutil to identify which process is touching a monitored file.
+    Returns a best-effort context dict; never raises exceptions to callers.
+    """
+
+    @staticmethod
+    def get_context_for_path(file_path: str) -> Dict[str, Any]:
+        ctx: Dict[str, Any] = {
+            "pid":          None,
+            "process_name": "Unknown",
+            "exe_path":     "Unknown",
+            "username":     "Unknown",
+            "cmdline":      "Unknown",
+            "session_type": "UNKNOWN",
+            "create_time":  None,
+        }
+
+        try:
+            fp_lower = file_path.lower()
+            for proc in psutil.process_iter(
+                ["pid", "name", "exe", "username", "cmdline", "create_time"]
+            ):
+                try:
+                    info = proc.info
+                    # Attempt open-file inspection (may raise AccessDenied)
+                    for of in proc.open_files():
+                        if of.path.lower() == fp_lower:
+                            ctime = info.get("create_time")
+                            ctx.update({
+                                "pid":          info["pid"],
+                                "process_name": info.get("name") or "Unknown",
+                                "exe_path":     info.get("exe")  or "Unknown",
+                                "username":     info.get("username") or "Unknown",
+                                "cmdline":      " ".join(info.get("cmdline") or []),
+                                "create_time":  (
+                                    datetime.fromtimestamp(ctime).isoformat()
+                                    if ctime else None
+                                ),
+                            })
+                            break
+                except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                    pass
+        except Exception:
+            pass
+
+        # Classify session type from username string
+        try:
+            uname = ctx.get("username", "").upper()
+            if "SYSTEM" in uname:
+                ctx["session_type"] = "SYSTEM"
+            elif "LOCAL SERVICE" in uname or "NETWORK SERVICE" in uname:
+                ctx["session_type"] = "SERVICE"
+            elif uname not in ("", "UNKNOWN"):
+                ctx["session_type"] = "INTERACTIVE"
+        except Exception:
+            pass
+
+        return ctx
+
+    @staticmethod
+    def current_username() -> str:
+        try:
+            return psutil.Process().username()
+        except Exception:
+            return "Unknown"
+
+
+# =============================================================================
+# ACL MONITOR
+# =============================================================================
+
+class ACLMonitor:
+    """
+    Reads Windows DACL (Discretionary Access Control List) via pywin32.
+    If pywin32 is not installed, all methods return None/Unknown and
+    the rest of the tool continues without ACL-change detection.
+    """
+
+    @staticmethod
+    def get_sddl(path: str) -> Optional[str]:
+        """Return SDDL string for the file's DACL + owner, or None."""
+        if not _WIN32_AVAILABLE or not os.path.exists(path):
+            return None
+        try:
+            sd = win32security.GetFileSecurity(
+                path,
+                win32security.DACL_SECURITY_INFORMATION |
+                win32security.OWNER_SECURITY_INFORMATION,
+            )
+            return sd.GetSecurityDescriptorSddl(
+                win32security.DACL_SECURITY_INFORMATION |
+                win32security.OWNER_SECURITY_INFORMATION,
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def get_owner(path: str) -> str:
+        if not _WIN32_AVAILABLE or not os.path.exists(path):
+            return "N/A (pywin32 not installed)" if not _WIN32_AVAILABLE else "Unknown"
+        try:
+            sd     = win32security.GetFileSecurity(path, win32security.OWNER_SECURITY_INFORMATION)
+            sid    = sd.GetSecurityDescriptorOwner()
+            name, domain, _ = win32security.LookupAccountSid(None, sid)
+            return f"{domain}\\{name}"
+        except Exception:
+            return "Unknown"
+
+
+# =============================================================================
+# BASELINE MANAGER
+# =============================================================================
+
+class BaselineManager:
+    """
+    Maintains a persistent JSON snapshot of monitored file metadata:
+    SHA-256 hash, size, mtime, ctime, SDDL (ACL), owner.
+
+    On-disk format:
+      {
+        "meta": { "created": ..., "tool": ..., "version": ... },
+        "entries": { "<absolute_path>": { ... } }
+      }
+    """
+
+    def __init__(self, config: Config) -> None:
+        self.config       = config
+        self.baseline_file = config.get("baseline", "file",
+                                        default="ironsentinel_baseline.json")
+        self.hash_algo    = config.get("baseline", "hash_algorithm", default="sha256")
+        self.baseline:    Dict[str, Dict] = {}
+        self._acl         = ACLMonitor()
+        self._lock        = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Hashing & metadata collection
+    # ------------------------------------------------------------------
+
+    def hash_file(self, path: str) -> Optional[str]:
+        """Return hex digest, or None on read error (e.g. locked file)."""
+        try:
+            h = hashlib.new(self.hash_algo)
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 16), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except (PermissionError, FileNotFoundError, OSError):
+            return None
+
+    def collect_metadata(self, path: str) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {
+            "exists": False, "is_dir": False,
+            "hash": None,    "size": None,
+            "mtime": None,   "ctime": None,
+            "acl":  None,    "owner": None,
+        }
+        try:
+            if not os.path.exists(path):
+                return meta
+            stat    = os.stat(path)
+            is_dir  = os.path.isdir(path)
+            meta.update({
+                "exists": True,
+                "is_dir": is_dir,
+                "hash":   self.hash_file(path) if not is_dir else None,
+                "size":   stat.st_size,
+                "mtime":  stat.st_mtime,
+                "ctime":  stat.st_ctime,
+                "acl":    self._acl.get_sddl(path),
+                "owner":  self._acl.get_owner(path),
+            })
+        except Exception:
+            pass
+        return meta
+
+    # ------------------------------------------------------------------
+    # Create baseline
+    # ------------------------------------------------------------------
+
+    def create_baseline(self, paths: List[str], recursive: bool = True) -> int:
+        """Scan all given paths and populate self.baseline. Returns file count."""
+        count = 0
+        with self._lock:
+            for base in paths:
+                base = os.path.expandvars(base)
+                if os.path.isfile(base):
+                    self.baseline[base] = self.collect_metadata(base)
+                    count += 1
+                elif os.path.isdir(base):
+                    iterator = (
+                        (os.path.join(r, f)
+                         for r, _, files in os.walk(base)
+                         for f in files)
+                        if recursive
+                        else (os.path.join(base, item)
+                              for item in os.listdir(base))
+                    )
+                    for fpath in iterator:
+                        try:
+                            self.baseline[fpath] = self.collect_metadata(fpath)
+                            count += 1
+                        except Exception:
+                            pass
+        return count
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self) -> bool:
+        try:
+            payload = {
+                "meta": {
+                    "created": datetime.now().isoformat(),
+                    "tool":    TOOL_NAME,
+                    "version": VERSION,
+                    "entries": len(self.baseline),
+                },
+                "entries": self.baseline,
+            }
+            with open(self.baseline_file, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+            logging.info(f"Baseline saved → {self.baseline_file} ({len(self.baseline)} entries)")
+            return True
+        except Exception as exc:
+            logging.error(f"Baseline save failed: {exc}")
+            return False
+
+    def load(self) -> bool:
+        if not os.path.exists(self.baseline_file):
+            return False
+        try:
+            with open(self.baseline_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.baseline = data.get("entries", {})
+            logging.info(f"Baseline loaded ← {self.baseline_file} ({len(self.baseline)} entries)")
+            return True
+        except Exception as exc:
+            logging.error(f"Baseline load failed: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Comparison
+    # ------------------------------------------------------------------
+
+    def diff(self, path: str) -> Optional[Dict]:
+        """
+        Compare a file's current state to the baseline.
+        Returns a diff dict, or None if nothing changed.
+        """
+        current = self.collect_metadata(path)
+
+        if path not in self.baseline:
+            if current["exists"]:
+                return {"type": "NEW_FILE", "path": path, "changes": [], "current": current, "baseline": None}
+            return None
+
+        base = self.baseline[path]
+
+        if not current["exists"] and base.get("exists"):
+            return {"type": "FILE_DELETED", "path": path, "changes": ["FILE_REMOVED"], "current": current, "baseline": base}
+
+        changes: List[str] = []
+
+        if base.get("hash") and current.get("hash") and base["hash"] != current["hash"]:
+            changes.append("HASH_CHANGED")
+
+        if base.get("size") is not None and current.get("size") is not None:
+            if base["size"] != current["size"]:
+                changes.append("SIZE_CHANGED")
+
+        if base.get("mtime") and current.get("mtime"):
+            if abs(base["mtime"] - current["mtime"]) > 1.5:
+                changes.append("MTIME_CHANGED")
+
+        if base.get("acl") and current.get("acl") and base["acl"] != current["acl"]:
+            changes.append("ACL_CHANGED")
+
+        if base.get("owner") and current.get("owner") and base["owner"] != current["owner"]:
+            changes.append("OWNER_CHANGED")
+
+        if changes:
+            return {"type": "FILE_MODIFIED", "path": path, "changes": changes,
+                    "current": current, "baseline": base}
+        return None
+
+    def update_entry(self, path: str) -> None:
+        """Refresh a single baseline entry after processing an event."""
+        with self._lock:
+            self.baseline[path] = self.collect_metadata(path)
+
+
+# =============================================================================
+# ALERT ENGINE
+# =============================================================================
+
+class AlertEngine:
+    """
+    Scores events 0-100, maps them to MITRE techniques, and emits rich
+    console panels plus optional JSON-lines log file output.
+    """
+
+    def __init__(self, config: Config, service_mode: bool = False) -> None:
+        self.config         = config
+        self.service_mode   = service_mode
+        self.log_file       = config.get("alerts", "log_file",   default="ironsentinel_alerts.jsonl")
+        self.log_to_file    = config.get("alerts", "log_to_file", default=True)
+        self.console_output = config.get("alerts", "console_output", default=True) and not service_mode
+        self.ignore_procs   = {p.lower() for p in config.get("ignore", "processes", default=[])}
+        self.alert_log:     List[Dict] = []
+        self._lock          = threading.Lock()
+        self._console       = Console(highlight=False)
+
+    # ------------------------------------------------------------------
+    # MITRE mapping
+    # ------------------------------------------------------------------
+
+    def map_mitre(self, path: str, event_type: str, changes: List[str]) -> List[str]:
+        path_lc = path.lower()
+        techs:  List[str] = []
+
+        # T1003 – Credential Dumping
+        for cp in CREDENTIAL_PATHS:
+            if cp.lower() in path_lc:
+                techs.append("T1003")
+                break
+        for kw in CREDENTIAL_KEYWORDS:
+            if kw in path_lc and "T1003" not in techs:
+                techs.append("T1003")
+                break
+
+        # T1222 – Permission Modification
+        if "ACL_CHANGED" in changes or "OWNER_CHANGED" in changes:
+            techs.append("T1222")
+
+        # T1485 – Data Destruction
+        if "DELETED" in event_type:
+            techs.append("T1485")
+
+        # T1565 – Data Manipulation
+        if "HASH_CHANGED" in changes or "MODIFIED" in event_type:
+            techs.append("T1565")
+
+        # T1112 – Modify Registry
+        if "REGISTRY" in event_type.upper():
+            techs.append("T1112")
+
+        # T1547 – Boot/Logon Autostart
+        autostart_indicators = [
+            r"currentversion\run", r"currentversion\runonce",
+            "startup", "winlogon", r"image file execution options",
+        ]
+        for ind in autostart_indicators:
+            if ind in path_lc:
+                techs.append("T1547")
+                break
+
+        return list(dict.fromkeys(techs))  # deduplicate, preserve order
+
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+
+    def score(self, event: Dict) -> int:
+        total = 0
+        path       = event.get("path",       "").lower()
+        etype      = event.get("event_type", "")
+        changes    = event.get("changes",    [])
+        mitre      = event.get("mitre_techniques", [])
+        proc_ctx   = event.get("process_context",  {})
+        proc_name  = proc_ctx.get("process_name", "").lower()
+
+        # Base score per event type
+        base_scores = {
+            "FILE_MODIFIED":    35,
+            "FILE_CREATED":     25,
+            "FILE_DELETED":     40,
+            "FILE_MOVED":       25,
+            "NEW_FILE":         20,
+            "REGISTRY_CREATED": 30,
+            "REGISTRY_MODIFIED":35,
+            "REGISTRY_DELETED": 38,
+            "ACL_CHANGED":      45,
+        }
+        total += base_scores.get(etype, 15)
+
+        # Credential path bonus
+        for cp in CREDENTIAL_PATHS:
+            if cp.lower() in path:
+                total += 35
+                break
+
+        # Credential keyword bonus
+        for kw in CREDENTIAL_KEYWORDS:
+            if kw in path:
+                total += 20
+                break
+
+        # Change-type bonuses
+        change_bonuses = {
+            "HASH_CHANGED":  10,
+            "ACL_CHANGED":   15,
+            "OWNER_CHANGED": 20,
+            "SIZE_CHANGED":   5,
+        }
+        for chg, bonus in change_bonuses.items():
+            if chg in changes:
+                total += bonus
+
+        # MITRE technique bonuses
+        for tid in mitre:
+            total += MITRE_TECHNIQUES.get(tid, {}).get("severity_bonus", 0)
+
+        # Process context adjustments
+        if proc_name and proc_name in SYSTEM_PROCESS_WHITELIST:
+            total = max(0, total - 15)
+
+        if proc_name in self.ignore_procs:
+            return 0   # suppress entirely
+
+        proc_session = proc_ctx.get("session_type", "")
+        if proc_session == "SYSTEM":
+            total += 5
+
+        return min(100, max(0, total))
+
+    # ------------------------------------------------------------------
+    # Alert construction
+    # ------------------------------------------------------------------
+
+    def build(
+        self,
+        event_type:      str,
+        path:            str,
+        changes:         Optional[List[str]] = None,
+        process_context: Optional[Dict]      = None,
+        extra:           Optional[Dict]      = None,
+    ) -> Dict:
+        """Construct a fully-decorated alert dict."""
+        changes         = changes         or []
+        process_context = process_context or {}
+        extra           = extra           or {}
+
+        mitre = self.map_mitre(path, event_type, changes)
+
+        alert = {
+            "timestamp":        datetime.now().isoformat(),
+            "tool":             TOOL_NAME,
+            "version":          VERSION,
+            "event_type":       event_type,
+            "path":             path,
+            "changes":          changes,
+            "mitre_techniques": mitre,
+            "process_context":  process_context,
+            **extra,
+        }
+
+        alert["score"]          = self.score(alert)
+        sev, colour, emoji      = get_severity(alert["score"])
+        alert["severity"]       = sev
+        alert["severity_colour"] = colour
+        alert["severity_emoji"] = emoji
+
+        return alert
+
+    # ------------------------------------------------------------------
+    # Alert dispatch
+    # ------------------------------------------------------------------
+
+    def fire(self, alert: Dict) -> None:
+        """Dispatch alert to console and/or log file."""
+        with self._lock:
+            # Drop if process is in ignore list
+            pname = alert.get("process_context", {}).get("process_name", "").lower()
+            if pname in self.ignore_procs:
+                return
+
+            if self.console_output:
+                self._render_console(alert)
+
+            if self.log_to_file:
+                self._write_jsonl(alert)
+
+            self.alert_log.append(alert)
+
+            # Forward to Python root logger
+            sev   = alert.get("severity", "INFO")
+            score = alert.get("score",    0)
+            etype = alert.get("event_type", "")
+            msg   = f"[{sev}] {etype} | {alert.get('path','')} | Score:{score}"
+
+            _lvl_map = {"CRITICAL": logging.CRITICAL, "HIGH": logging.ERROR,
+                        "MEDIUM": logging.WARNING}
+            logging.log(_lvl_map.get(sev, logging.INFO), msg)
+
+    # ------------------------------------------------------------------
+    # Console rendering (Rich)
+    # ------------------------------------------------------------------
+
+    def _render_console(self, alert: Dict) -> None:
+        sev    = alert.get("severity",        "INFO")
+        colour = alert.get("severity_colour", "white")
+        emoji  = alert.get("severity_emoji",  "ℹ️ ")
+        score  = alert.get("score",           0)
+        etype  = alert.get("event_type",      "")
+        path   = alert.get("path",            "")
+        ts     = alert.get("timestamp",       "")
+        chgs   = alert.get("changes",         [])
+        mitre  = alert.get("mitre_techniques",[])
+        pctx   = alert.get("process_context", {})
+
+        # ---- MITRE references line ----
+        mitre_parts = []
+        for tid in mitre:
+            tdata = MITRE_TECHNIQUES.get(tid, {})
+            mitre_parts.append(f"[magenta]{tid}[/magenta] [dim]({tdata.get('name','?')})[/dim]")
+
+        # ---- Build content ----
+        lines: List[str] = []
+        lines.append(
+            f"[bold {colour}]{emoji}  {sev}[/bold {colour}]"
+            f"  [bold white]{etype}[/bold white]"
+            f"  [dim]Score:[/dim] [bold {colour}]{score}/100[/bold {colour}]"
+        )
+        lines.append(f"[dim]Timestamp :[/dim] [white]{ts}[/white]")
+        lines.append(f"[dim]Path/Key  :[/dim] [cyan]{path}[/cyan]")
+
+        if chgs:
+            lines.append(
+                f"[dim]Changes   :[/dim] [yellow]{'  ·  '.join(chgs)}[/yellow]"
+            )
+
+        if mitre_parts:
+            lines.append(f"[dim]MITRE     :[/dim] {'  ·  '.join(mitre_parts)}")
+
+        # Process context block
+        if pctx.get("pid"):
+            lines.append(
+                f"[dim]Process   :[/dim] [green]{pctx.get('process_name','?')}[/green]"
+                f" [dim](PID {pctx.get('pid','?')})[/dim]"
+            )
+            lines.append(
+                f"[dim]User      :[/dim] [green]{pctx.get('username','?')}[/green]"
+                f" [dim][{pctx.get('session_type','?')}][/dim]"
+            )
+            exe = pctx.get("exe_path","")
+            if exe and exe != "Unknown":
+                lines.append(f"[dim]Exe       :[/dim] [dim white]{exe}[/dim white]")
+
+        # Registry value diff
+        if "old_value" in alert or "new_value" in alert:
+            lines.append(f"[dim]Old Value :[/dim] [red]{alert.get('old_value','N/A')}[/red]")
+            lines.append(f"[dim]New Value :[/dim] [green]{alert.get('new_value','N/A')}[/green]")
+
+        content = "\n".join(lines)
+
+        panel_title = (
+            f"[bold {colour}] ⚔  {TOOL_NAME} [/bold {colour}]"
+            f"[dim] — {sev} Alert[/dim]"
+        )
+
+        self._console.print(
+            Panel(
+                content,
+                title=panel_title,
+                border_style=colour,
+                expand=False,
+                padding=(0, 2),
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # JSON-lines log
+    # ------------------------------------------------------------------
+
+    def _write_jsonl(self, alert: Dict) -> None:
+        try:
+            # Strip rich-only fields before serialisation
+            record = {k: v for k, v in alert.items() if k != "severity_colour"}
+            with open(self.log_file, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+        except Exception as exc:
+            logging.error(f"Alert log write failed: {exc}")
+
+
+# =============================================================================
+# FILE SYSTEM EVENT HANDLER  (Watchdog)
+# =============================================================================
+
+class FIMEventHandler(FileSystemEventHandler):
+    """
+    Handles watchdog filesystem events: created, modified, deleted, moved.
+    Each event is de-duplicated, checked against the baseline, attributed
+    to a process, and fired through the AlertEngine.
+    """
+
+    _DEDUP_WINDOW = 2.5   # seconds
+
+    def __init__(
+        self,
+        alert_engine:    AlertEngine,
+        baseline:        BaselineManager,
+        config:          Config,
+        proc_collector:  ProcessContextCollector,
+    ) -> None:
+        super().__init__()
+        self.engine         = alert_engine
+        self.baseline       = baseline
+        self.config         = config
+        self.proc_collector = proc_collector
+
+        self._ignore_paths  = [
+            p.lower() for p in config.get("ignore", "paths",      default=[])
+        ]
+        self._ignore_exts   = {
+            e.lower() for e in config.get("ignore", "extensions",  default=[])
+        }
+        self._watch_exts    = {
+            e.lower() for e in config.get("monitor", "extensions", default=[])
+        }
+        self._dedup_cache:  Dict[str, float] = {}
+        self._dedup_lock    = threading.Lock()
+
+    # ------------------------------------------------------------------
+
+    def _is_ignored(self, path: str) -> bool:
+        pl = path.lower()
+        for ip in self._ignore_paths:
+            if ip in pl:
+                return True
+        ext = os.path.splitext(pl)[1]
+        if ext in self._ignore_exts:
+            return True
+        if self._watch_exts and ext not in self._watch_exts:
+            return True
+        return False
+
+    def _is_duplicate(self, key: str) -> bool:
+        now = time.monotonic()
+        with self._dedup_lock:
+            if key in self._dedup_cache:
+                if now - self._dedup_cache[key] < self._DEDUP_WINDOW:
+                    return True
+            self._dedup_cache[key] = now
+            # Prune stale entries
+            stale = [k for k, v in self._dedup_cache.items()
+                     if now - v > self._DEDUP_WINDOW * 3]
+            for k in stale:
+                del self._dedup_cache[k]
+        return False
+
+    def _handle(self, path: str, event_type: str) -> None:
+        if self._is_ignored(path):
+            return
+        if self._is_duplicate(f"{event_type}:{path}"):
+            return
+
+        diff    = self.baseline.diff(path)
+        changes = diff.get("changes", []) if diff else []
+
+        # Fetch process context in a thread to avoid blocking the observer
+        pctx = self.proc_collector.get_context_for_path(path)
+
+        alert = self.engine.build(
+            event_type=event_type,
+            path=path,
+            changes=changes,
+            process_context=pctx,
+        )
+        self.engine.fire(alert)
+
+        if self.config.get("baseline", "auto_save", default=True):
+            self.baseline.update_entry(path)
+
+    # Watchdog callbacks
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._handle(event.src_path, "FILE_MODIFIED")
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._handle(event.src_path, "FILE_CREATED")
+
+    def on_deleted(self, event):
+        if not event.is_directory:
+            self._handle(event.src_path, "FILE_DELETED")
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._handle(event.src_path, "FILE_MOVED")
+
+
+# =============================================================================
+# REGISTRY MONITOR  (polling thread)
+# =============================================================================
+
+class RegistryMonitor(threading.Thread):
+    """
+    Polls Windows Registry keys at a configurable interval, comparing
+    value names/data to a snapshot taken at startup.  Fires alerts via
+    the AlertEngine on CREATE / MODIFY / DELETE of any registry value.
+    """
+
+    _HIVE_MAP = {
+        "HKLM": winreg.HKEY_LOCAL_MACHINE,
+        "HKCU": winreg.HKEY_CURRENT_USER,
+        "HKCR": winreg.HKEY_CLASSES_ROOT,
+        "HKU":  winreg.HKEY_USERS,
+        "HKCC": winreg.HKEY_CURRENT_CONFIG,
+    }
+
+    def __init__(
+        self,
+        keys:          List[str],
+        alert_engine:  AlertEngine,
+        poll_interval: int = 10,
+    ) -> None:
+        super().__init__(daemon=True, name="IronSentinel-RegistryMonitor")
+        self.keys          = keys
+        self.engine        = alert_engine
+        self.poll_interval = poll_interval
+        self._stop         = threading.Event()
+        self._snapshots:   Dict[str, Dict[str, Dict]] = {}
+
+    # ------------------------------------------------------------------
+
+    def _split_key(self, key_path: str):
+        """Split 'HKLM\\Software\\...' into (hive_handle, subkey_string)."""
+        parts    = key_path.split("\\", 1)
+        hive_str = parts[0].upper()
+        subkey   = parts[1] if len(parts) > 1 else ""
+        return self._HIVE_MAP.get(hive_str), subkey
+
+    def _snapshot(self, key_path: str) -> Dict[str, Dict]:
+        snap: Dict[str, Dict] = {}
+        hive, subkey = self._split_key(key_path)
+        if not hive:
+            return snap
+        try:
+            with winreg.OpenKey(
+                hive, subkey, 0,
+                winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+            ) as key:
+                idx = 0
+                while True:
+                    try:
+                        name, data, dtype = winreg.EnumValue(key, idx)
+                        snap[name] = {"data": str(data), "type": dtype}
+                        idx += 1
+                    except OSError:
+                        break
+        except (FileNotFoundError, PermissionError, OSError):
+            pass
+        return snap
+
+    def _poll(self) -> None:
+        for key_path in self.keys:
+            try:
+                current  = self._snapshot(key_path)
+                previous = self._snapshots.get(key_path, {})
+
+                for name, val in current.items():
+                    full_path = f"{key_path}\\{name}"
+                    if name not in previous:
+                        alert = self.engine.build(
+                            event_type="REGISTRY_CREATED",
+                            path=full_path,
+                            changes=["VALUE_ADDED"],
+                            extra={
+                                "registry_key": key_path,
+                                "value_name":   name,
+                                "new_value":    val["data"],
+                                "old_value":    None,
+                            },
+                        )
+                        self.engine.fire(alert)
+                    elif val["data"] != previous[name]["data"]:
+                        alert = self.engine.build(
+                            event_type="REGISTRY_MODIFIED",
+                            path=full_path,
+                            changes=["VALUE_MODIFIED"],
+                            extra={
+                                "registry_key": key_path,
+                                "value_name":   name,
+                                "new_value":    val["data"],
+                                "old_value":    previous[name]["data"],
+                            },
+                        )
+                        self.engine.fire(alert)
+
+                for name in previous:
+                    if name not in current:
+                        full_path = f"{key_path}\\{name}"
+                        alert = self.engine.build(
+                            event_type="REGISTRY_DELETED",
+                            path=full_path,
+                            changes=["VALUE_DELETED"],
+                            extra={
+                                "registry_key": key_path,
+                                "value_name":   name,
+                                "old_value":    previous[name]["data"],
+                                "new_value":    None,
+                            },
+                        )
+                        self.engine.fire(alert)
+
+                self._snapshots[key_path] = current
+
+            except Exception as exc:
+                logging.debug(f"Registry poll error ({key_path}): {exc}")
+
+    def run(self) -> None:
+        for key_path in self.keys:
+            self._snapshots[key_path] = self._snapshot(key_path)
+        logging.info(f"Registry monitor started — {len(self.keys)} key(s), "
+                     f"polling every {self.poll_interval}s")
+        while not self._stop.is_set():
+            self._poll()
+            self._stop.wait(self.poll_interval)
+        logging.info("Registry monitor stopped.")
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+# =============================================================================
+# MAIN AGENT ORCHESTRATOR
+# =============================================================================
+
+class IronSentinelAgent:
+    """
+    Top-level orchestrator.  Wires together all components, handles
+    lifecycle (start / stop / graceful shutdown), and exposes the
+    baseline creation / integrity-check workflows.
+    """
+
+    def __init__(
+        self,
+        config_path:  str  = "config.yaml",
+        debug:        bool = False,
+        service_mode: bool = False,
+    ) -> None:
+        self.config          = Config(config_path)
+        self.debug           = debug
+        self.service_mode    = service_mode
+        self._console        = Console(highlight=False)
+        self._stop_event     = threading.Event()
+        self._running        = False
+
+        self._setup_logging()
+
+        # Core components
+        self.baseline   = BaselineManager(self.config)
+        self.alert_engine = AlertEngine(self.config, service_mode=service_mode)
+        self.proc_col   = ProcessContextCollector()
+        self.observer   = Observer()
+        self.reg_monitor: Optional[RegistryMonitor] = None
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def _setup_logging(self) -> None:
+        level    = logging.DEBUG if self.debug else logging.INFO
+        log_file = self.config.get("logging", "file", default="ironsentinel.log")
+
+        handlers: List[logging.Handler] = [logging.FileHandler(log_file, encoding="utf-8")]
+        if self.debug:
+            handlers.append(logging.StreamHandler(sys.stdout))
+
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s  [%(levelname)-8s]  %(message)s",
+            handlers=handlers,
+            force=True,
+        )
+        logging.info(f"{TOOL_NAME} v{VERSION} — logging initialised.")
+
+    def _print_banner(self) -> None:
+        if self.service_mode:
+            return
+
+        # ASCII wordmark kept short to fit 80-col terminals cleanly
+        self._console.print("\n")
+        self._console.rule(
+            f"[bold cyan] ⚔  {TOOL_NAME}  v{VERSION} [/bold cyan]", style="cyan"
+        )
+        self._console.print(
+            f"[dim]  {TOOL_TAGLINE}[/dim]"
+            f"  ·  [dim]By [bold white]{AUTHOR}[/bold white][/dim]"
+        )
+        self._console.print(
+            "[dim]  MITRE ATT&CK: "
+            + "  ·  ".join(MITRE_TECHNIQUES.keys())
+            + "[/dim]"
+        )
+        self._console.print()
+
+    # ------------------------------------------------------------------
+    # Baseline workflow
+    # ------------------------------------------------------------------
+
+    def initialize_baseline(self) -> None:
+        paths     = self.config.get("monitor", "paths",     default=[])
+        recursive = self.config.get("monitor", "recursive", default=True)
+
+        if self.baseline.load():
+            msg = f"Baseline loaded — {len(self.baseline.baseline)} entries"
+            if not self.service_mode:
+                self._console.print(f"[green]✔  {msg}[/green]")
+            logging.info(msg)
+        else:
+            msg = "No baseline found — creating initial snapshot…"
+            if not self.service_mode:
+                self._console.print(f"[yellow]⚠  {msg}[/yellow]")
+            logging.info(msg)
+            count = self.baseline.create_baseline(paths, recursive)
+            self.baseline.save()
+            done_msg = f"Baseline created — {count} entries"
+            if not self.service_mode:
+                self._console.print(f"[green]✔  {done_msg}[/green]")
+            logging.info(done_msg)
+
+    # ------------------------------------------------------------------
+    # Start / stop
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._print_banner()
+        self.initialize_baseline()
+
+        paths     = self.config.get("monitor", "paths",     default=[])
+        recursive = self.config.get("monitor", "recursive", default=True)
+
+        handler = FIMEventHandler(
+            self.alert_engine, self.baseline, self.config, self.proc_col
+        )
+
+        watched = 0
+        for watch_path in paths:
+            watch_path = os.path.expandvars(watch_path)
+            if os.path.exists(watch_path):
+                try:
+                    self.observer.schedule(handler, watch_path, recursive=recursive)
+                    watched += 1
+                    logging.info(f"Watching: {watch_path}")
+                except Exception as exc:
+                    logging.warning(f"Cannot watch {watch_path}: {exc}")
+            else:
+                logging.warning(f"Path not found, skipping: {watch_path}")
+
+        self.observer.start()
+        if not self.service_mode:
+            self._console.print(f"[green]✔  File monitor active[/green]  — {watched} path(s)")
+
+        # Registry monitor
+        reg_keys      = self.config.get("monitor", "registry_keys",        default=[])
+        poll_interval = self.config.get("monitor", "registry_poll_interval", default=10)
+
+        if reg_keys:
+            self.reg_monitor = RegistryMonitor(reg_keys, self.alert_engine, poll_interval)
+            self.reg_monitor.start()
+            if not self.service_mode:
+                self._console.print(
+                    f"[green]✔  Registry monitor active[/green]  — {len(reg_keys)} key(s)"
+                )
+
+        if not self.service_mode:
+            self._console.print(
+                f"\n[bold green]🛡  {TOOL_NAME} is running.  Press Ctrl+C to stop.[/bold green]\n"
+            )
+        logging.info(f"{TOOL_NAME} fully started.")
+
+        try:
+            while not self._stop_event.is_set():
+                self._stop_event.wait(1)
+        except KeyboardInterrupt:
+            self.stop()
+
+    def stop(self) -> None:
+        if not self._running:
+            return
+
+        if not self.service_mode:
+            self._console.print(f"\n[yellow]⏹  Stopping {TOOL_NAME}…[/yellow]")
+
+        self._stop_event.set()
+        self._running = False
+
+        self.observer.stop()
+        self.observer.join(timeout=8)
+
+        if self.reg_monitor:
+            self.reg_monitor.stop()
+            self.reg_monitor.join(timeout=8)
+
+        if self.config.get("baseline", "auto_save", default=True):
+            self.baseline.save()
+
+        total = len(self.alert_engine.alert_log)
+        msg   = f"Shutdown complete. Total alerts fired: {total}"
+        if not self.service_mode:
+            self._console.print(f"[green]✔  {msg}[/green]")
+        logging.info(msg)
+
+    # ------------------------------------------------------------------
+    # Baseline integrity check (manual / offline mode)
+    # ------------------------------------------------------------------
+
+    def run_integrity_check(self) -> None:
+        self._print_banner()
+        self._console.print("[bold cyan]🔍  Running baseline integrity check…[/bold cyan]\n")
+
+        if not self.baseline.load():
+            self._console.print(
+                "[red]✘  No baseline file found. "
+                "Run  --baseline-create  first.[/red]"
+            )
+            return
+
+        issues = 0
+        checked = 0
+        for path in list(self.baseline.baseline.keys()):
+            d = self.baseline.diff(path)
+            checked += 1
+            if d:
+                issues += 1
+                alert = self.alert_engine.build(
+                    event_type=d["type"],
+                    path=path,
+                    changes=d.get("changes", []),
+                )
+                self.alert_engine.fire(alert)
+
+        colour = "red" if issues else "green"
+        self._console.print(
+            f"\n[bold]Integrity Check Complete[/bold]\n"
+            f"  Files checked : {checked}\n"
+            f"  Issues found  : [{colour}]{issues}[/{colour}]"
+        )
+
+
+# =============================================================================
+# UTILITY
+# =============================================================================
+
+def is_admin() -> bool:
+    """Return True when the process has administrator / elevated privileges."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+# =============================================================================
+# CLI ENTRY POINT
+# =============================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ironsentinel",
+        description=f"{TOOL_NAME} v{VERSION} — {TOOL_TAGLINE}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+──────────────────────────────────────────────────────────────────────────────
+Examples
+  ironsentinel_agent.py --run
+  ironsentinel_agent.py --run --debug
+  ironsentinel_agent.py --run --config C:\\custom\\config.yaml
+  ironsentinel_agent.py --baseline-create
+  ironsentinel_agent.py --baseline-check
+
+Windows Service (run service.py as Administrator)
+  python service.py install
+  python service.py start
+  python service.py stop
+  python service.py uninstall
+──────────────────────────────────────────────────────────────────────────────
+""",
+    )
+    parser.add_argument("--run",              action="store_true",
+                        help="Start real-time monitoring in console mode")
+    parser.add_argument("--debug",            action="store_true",
+                        help="Enable verbose debug output")
+    parser.add_argument("--config",           default="config.yaml", metavar="PATH",
+                        help="Path to YAML config file (default: config.yaml)")
+    parser.add_argument("--baseline-create",  action="store_true",
+                        help="Create / refresh the baseline snapshot")
+    parser.add_argument("--baseline-check",   action="store_true",
+                        help="Run an offline integrity check against the baseline")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args   = parser.parse_args()
+
+    console = Console(highlight=False)
+
+    if not is_admin():
+        console.print(
+            "[yellow]⚠  WARNING:[/yellow] Not running as Administrator. "
+            "Some protected paths will be inaccessible.\n"
+        )
+
+    agent = IronSentinelAgent(config_path=args.config, debug=args.debug)
+
+    if args.baseline_create:
+        agent._print_banner()
+        paths     = agent.config.get("monitor", "paths",     default=[])
+        recursive = agent.config.get("monitor", "recursive", default=True)
+        count     = agent.baseline.create_baseline(paths, recursive)
+        agent.baseline.save()
+        console.print(f"[green]✔  Baseline created with {count} entries.[/green]")
+
+    elif args.baseline_check:
+        agent.run_integrity_check()
+
+    elif args.run:
+        agent.start()
+
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
