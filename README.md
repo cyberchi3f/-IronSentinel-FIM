@@ -1,9 +1,9 @@
 # ⚔ IronSentinel-FIM  v1.0.0
 
 **Windows-Native File Integrity Monitoring & Privilege Abuse Detection Agent**  
-*By Simon Etim
+*By Simon Etim*
 
----
+
 
 ## Overview
 
